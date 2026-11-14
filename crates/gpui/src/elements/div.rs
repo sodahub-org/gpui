@@ -3232,6 +3232,7 @@ impl Interactivity {
                     let source_bounds = hitbox.bounds;
                     move |window: &Window| {
                         !window.last_input_was_keyboard()
+                            && window.mouse_position_is_valid()
                             && pending_mouse_down.borrow().is_none()
                             && source_bounds.contains(&window.mouse_position())
                     }
@@ -4000,7 +4001,9 @@ fn handle_tooltip_check_visible_and_update(
     }
 
     let is_hovered = check_is_hovered(window)
-        || (tooltip_is_hoverable && tooltip_bounds.contains(&window.mouse_position()));
+        || (tooltip_is_hoverable
+            && window.mouse_position_is_valid()
+            && tooltip_bounds.contains(&window.mouse_position()));
     let action = match active_tooltip.borrow().as_ref() {
         Some(ActiveTooltip::Visible { tooltip, .. }) => {
             if is_hovered {

@@ -399,24 +399,28 @@ impl WindowsWindowInner {
         // exit to the app, verify against the real cursor position that it
         // actually left the window; otherwise hovering the title bar would
         // clear hover state and the caption buttons would flash.
-        let Some(cursor_point) = Self::cursor_outside_client_area(handle) else {
+        if Self::cursor_over_window_client(handle).is_some() {
             // The cursor is still over the window. The leave message disarmed
             // the tracking, so re-arm it; otherwise a fast flick out of the
             // window from the title bar would never report an exit. Pick the
             // flags by the region the cursor is actually in, so the armed
             // condition isn't already satisfied (which would repost the leave
             // message every time the cursor moves, and re-arm it in a loop).
-            let flags = if Self::cursor_over_client_area(handle) {
+            let flags = if Self::cursor_over_client_hit_area(handle) {
                 TME_LEAVE
             } else {
                 TME_LEAVE | TME_NONCLIENT
             };
             self.start_tracking_mouse(handle, flags);
             return Some(0);
-        };
+        }
 
+        // The cursor left this window, or another window covers it. Re-arming
+        // TrackMouseEvent in either state would generate the leave
+        // notification immediately and loop.
         if let Some(mut func) = self.state.callbacks.input.take() {
             let scale_factor = self.state.scale_factor.get();
+            let cursor_point = Self::cursor_in_client_coords(handle).unwrap_or_default();
             let input = PlatformInput::MouseExited(MouseExitEvent {
                 position: logical_point(cursor_point.x as f32, cursor_point.y as f32, scale_factor),
                 pressed_button: None,
@@ -429,35 +433,45 @@ impl WindowsWindowInner {
         Some(0)
     }
 
-    /// Returns the real cursor position in window client coordinates when the
-    /// cursor is outside of the client rectangle, or `None` when it is still
-    /// inside the window. An undeterminable position is treated as outside,
-    /// so the exit is never lost; the core doesn't trust exit positions anyway.
-    fn cursor_outside_client_area(handle: HWND) -> Option<POINT> {
-        let mut client_rect = RECT::default();
-        if unsafe { GetClientRect(handle, &mut client_rect) }.is_err() {
-            return Some(POINT { x: 0, y: 0 });
-        }
+    /// Converts the real cursor position to window client coordinates, or
+    /// `None` if it can't be determined.
+    fn cursor_in_client_coords(handle: HWND) -> Option<POINT> {
         let mut cursor_point = POINT { x: 0, y: 0 };
-        if unsafe { GetCursorPos(&mut cursor_point) }.is_err() {
-            return Some(POINT { x: 0, y: 0 });
-        }
-        if unsafe { ScreenToClient(handle, &mut cursor_point) }
+        unsafe { GetCursorPos(&mut cursor_point) }.ok()?;
+        unsafe { ScreenToClient(handle, &mut cursor_point) }
             .ok()
-            .is_err()
-        {
-            return Some(POINT { x: 0, y: 0 });
+            .ok()?;
+        Some(cursor_point)
+    }
+
+    /// Returns the real cursor position in window client coordinates when the
+    /// cursor is over this window's client area and this window is the
+    /// topmost window at the cursor (another window may cover ours even when
+    /// the cursor is geometrically inside our client rectangle), or `None`
+    /// otherwise. A position that can't be determined counts as not over the
+    /// window, so the exit is never lost; the core doesn't trust exit
+    /// positions anyway.
+    fn cursor_over_window_client(handle: HWND) -> Option<POINT> {
+        let mut cursor_point = POINT { x: 0, y: 0 };
+        unsafe { GetCursorPos(&mut cursor_point) }.ok()?;
+        if unsafe { WindowFromPoint(cursor_point) } != handle {
+            return None;
         }
-        let outside = cursor_point.x < client_rect.left
-            || cursor_point.x >= client_rect.right
-            || cursor_point.y < client_rect.top
-            || cursor_point.y >= client_rect.bottom;
-        outside.then_some(cursor_point)
+        unsafe { ScreenToClient(handle, &mut cursor_point) }
+            .ok()
+            .ok()?;
+        let mut client_rect = RECT::default();
+        unsafe { GetClientRect(handle, &mut client_rect) }.ok()?;
+        let inside = cursor_point.x >= client_rect.left
+            && cursor_point.x < client_rect.right
+            && cursor_point.y >= client_rect.top
+            && cursor_point.y < client_rect.bottom;
+        inside.then_some(cursor_point)
     }
 
     /// Asks the window where the real cursor currently is, returning whether
     /// it is over the client area (`HTCLIENT`).
-    fn cursor_over_client_area(handle: HWND) -> bool {
+    fn cursor_over_client_hit_area(handle: HWND) -> bool {
         let mut cursor_point = POINT { x: 0, y: 0 };
         if unsafe { GetCursorPos(&mut cursor_point) }.is_err() {
             // Assume the common case; a wrong guess only re-arms tracking

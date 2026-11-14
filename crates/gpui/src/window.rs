@@ -976,7 +976,8 @@ impl TooltipId {
             .tooltip_bounds
             .as_ref()
             .is_some_and(|tooltip_bounds| {
-                tooltip_bounds.id == *self
+                window.mouse_position_is_valid()
+                    && tooltip_bounds.id == *self
                     && tooltip_bounds.bounds.contains(&window.mouse_position())
             })
     }
@@ -3550,6 +3551,15 @@ impl Window {
     /// The position of the mouse relative to the window.
     pub fn mouse_position(&self) -> Point<Pixels> {
         self.mouse_position
+    }
+
+    /// Whether `mouse_position` reflects a position the cursor actually held
+    /// inside the window. Returns `false` after the mouse exited, until the
+    /// next in-window mouse move. Checks that compare positions against
+    /// `mouse_position` must gate on this, or a stale position keeps them
+    /// active after the mouse left the window.
+    pub fn mouse_position_is_valid(&self) -> bool {
+        self.mouse_position_valid
     }
 
     /// Captures the pointer for the given hitbox. While captured, all mouse move and mouse up
@@ -6271,9 +6281,11 @@ impl Window {
                 // window (macOS sends a trailing move with a position outside
                 // of it). Only remember positions inside the viewport, so a
                 // stale position can't re-light hover state after an exit.
-                // While a hitbox captured the pointer, accept any position so
-                // drags that leave the window keep tracking the cursor.
+                // While a hitbox captured the pointer or an element drag is in
+                // progress, accept any position so drags that leave the window
+                // keep tracking the cursor.
                 if self.captured_hitbox.is_some()
+                    || cx.active_drag.is_some()
                     || Bounds::new(Point::default(), self.viewport_size)
                         .contains(&mouse_move.position)
                 {
@@ -6312,8 +6324,10 @@ impl Window {
                 // captured the pointer, keep the state so drags that leave the
                 // window keep tracking the cursor. The discard itself is
                 // deferred until after the event is dispatched, so exit
-                // listeners still see the pre-exit hover state.
-                if self.captured_hitbox.is_none() {
+                // listeners still see the pre-exit hover state. An exit during
+                // an element drag (which doesn't capture the pointer) keeps
+                // the state so the drag keeps tracking the cursor.
+                if self.captured_hitbox.is_none() && cx.active_drag.is_none() {
                     clear_hover_after_dispatch = true;
                 }
                 self.modifiers = mouse_exited.modifiers;

@@ -1373,6 +1373,10 @@ pub struct Window {
     focus_lost_path: SmallVec<[FocusId; 8]>,
     default_prevented: bool,
     mouse_position: Point<Pixels>,
+    /// Whether `mouse_position` reflects a position the cursor actually held
+    /// inside the window. Cleared when the mouse exits, restored by the next
+    /// in-window mouse move, so stale coordinates can't keep hover state alive.
+    mouse_position_valid: bool,
     mouse_hit_test: HitTest,
     modifiers: Modifiers,
     capslock: Capslock,
@@ -1769,6 +1773,8 @@ impl Window {
         let modifiers = platform_window.modifiers();
         let capslock = platform_window.capslock();
         let content_size = platform_window.content_size();
+        let mouse_position_valid =
+            Bounds::new(Point::default(), content_size).contains(&mouse_position);
         let scale_factor = platform_window.scale_factor();
         let appearance = platform_window.appearance();
         let text_system = Arc::new(WindowTextSystem::new(cx.text_system().clone()));
@@ -2315,6 +2321,7 @@ impl Window {
             focus_lost_path: SmallVec::new(),
             default_prevented: true,
             mouse_position,
+            mouse_position_valid,
             mouse_hit_test: HitTest::default(),
             modifiers,
             capslock,
@@ -4050,7 +4057,7 @@ impl Window {
             tooltip_element = self.prepaint_tooltip(cx);
         }
 
-        self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
+        self.mouse_hit_test = self.mouse_hit_test_for_frame(&self.next_frame);
 
         // Now actually paint the elements.
         #[cfg(feature = "profiler")]
@@ -6251,16 +6258,37 @@ impl Window {
         // Handlers may set this to true by calling `prevent_default`.
         self.default_prevented = false;
 
+        // Whether to discard the remembered mouse position after dispatching.
+        // Exit listeners (e.g. `on_mouse_exit`) gate on the hover state they
+        // are leaving, so they must still see the pre-exit hit test.
+        let mut clear_hover_after_dispatch = false;
+
         let event = match event {
             // Track the mouse position with our own state, since accessing the platform
             // API for the mouse position can only occur on the main thread.
             PlatformInput::MouseMove(mouse_move) => {
-                self.mouse_position = mouse_move.position;
+                // Platforms may deliver a mouse move after the cursor left the
+                // window (macOS sends a trailing move with a position outside
+                // of it). Only remember positions inside the viewport, so a
+                // stale position can't re-light hover state after an exit.
+                // While a hitbox captured the pointer, accept any position so
+                // drags that leave the window keep tracking the cursor.
+                if self.captured_hitbox.is_some()
+                    || Bounds::new(Point::default(), self.viewport_size)
+                        .contains(&mouse_move.position)
+                {
+                    self.mouse_position = mouse_move.position;
+                    self.mouse_position_valid = true;
+                }
                 self.modifiers = mouse_move.modifiers;
                 PlatformInput::MouseMove(mouse_move)
             }
             PlatformInput::MouseDown(mouse_down) => {
                 self.mouse_position = mouse_down.position;
+                // A11y clicks dispatch down/up without a prior in-window move,
+                // so treat the event position as authoritative; otherwise the
+                // click wouldn't reach the hovered listeners after an exit.
+                self.mouse_position_valid = true;
                 self.modifiers = mouse_down.modifiers;
                 if let Some(coast) = self.scroll_coast.as_mut() {
                     coast.stop();
@@ -6269,6 +6297,7 @@ impl Window {
             }
             PlatformInput::MouseUp(mouse_up) => {
                 self.mouse_position = mouse_up.position;
+                self.mouse_position_valid = true;
                 self.modifiers = mouse_up.modifiers;
                 PlatformInput::MouseUp(mouse_up)
             }
@@ -6276,6 +6305,17 @@ impl Window {
                 PlatformInput::MousePressure(mouse_pressure)
             }
             PlatformInput::MouseExited(mouse_exited) => {
+                // The exit position is unreliable across platforms (it's not
+                // necessarily outside the window), so discard the remembered
+                // position instead of updating it. Hover dies with it and is
+                // restored by the next in-window mouse move. While a hitbox
+                // captured the pointer, keep the state so drags that leave the
+                // window keep tracking the cursor. The discard itself is
+                // deferred until after the event is dispatched, so exit
+                // listeners still see the pre-exit hover state.
+                if self.captured_hitbox.is_none() {
+                    clear_hover_after_dispatch = true;
+                }
                 self.modifiers = mouse_exited.modifiers;
                 PlatformInput::MouseExited(mouse_exited)
             }
@@ -6302,6 +6342,7 @@ impl Window {
             PlatformInput::FileDrop(file_drop) => match file_drop {
                 FileDropEvent::Entered { position, paths } => {
                     self.mouse_position = position;
+                    self.mouse_position_valid = true;
                     let source_window = self.handle.window_id();
                     if !cx.restore_platform_drag(source_window) && cx.active_drag.is_none() {
                         cx.active_drag = Some(AnyDrag {
@@ -6320,6 +6361,7 @@ impl Window {
                 }
                 FileDropEvent::Pending { position } => {
                     self.mouse_position = position;
+                    self.mouse_position_valid = true;
                     PlatformInput::MouseMove(MouseMoveEvent {
                         position,
                         pressed_button: Some(MouseButton::Left),
@@ -6356,6 +6398,7 @@ impl Window {
                 } else {
                     long_press.position
                 };
+                self.mouse_position_valid = true;
                 if long_press.phase == crate::TouchPhase::Started {
                     self.long_press_capture = None;
                 }
@@ -6363,6 +6406,7 @@ impl Window {
             }
             PlatformInput::TouchDrag(touch_drag) => {
                 self.mouse_position = touch_drag.start_position;
+                self.mouse_position_valid = true;
                 PlatformInput::TouchDrag(touch_drag)
             }
             PlatformInput::KeyDown(_) | PlatformInput::KeyUp(_) => event,
@@ -6397,6 +6441,12 @@ impl Window {
         // Must run after the move is dispatched: the platform owns the gesture afterwards, so this
         // is the last chance for drag listeners to see the pointer leave and reset their state.
         self.promote_external_drag_to_platform(&event, cx);
+
+        if clear_hover_after_dispatch {
+            self.mouse_position_valid = false;
+            self.mouse_hit_test = HitTest::default();
+            self.refresh();
+        }
 
         let caused_invalidation = self.invalidator.update_count() > update_count_before;
         if caused_invalidation {
@@ -6510,11 +6560,13 @@ impl Window {
         match gesture {
             RecognizedTouchGesture::Scroll(scroll_wheel) => {
                 self.mouse_position = scroll_wheel.position;
+                self.mouse_position_valid = true;
                 cx.propagate_event = true;
                 self.dispatch_mouse_event(&scroll_wheel, cx);
             }
             RecognizedTouchGesture::Tap { down, up } => {
                 self.mouse_position = up.position;
+                self.mouse_position_valid = true;
                 cx.propagate_event = true;
                 self.dispatch_mouse_event(&down, cx);
                 cx.propagate_event = true;
@@ -6522,6 +6574,7 @@ impl Window {
             }
             RecognizedTouchGesture::TouchDrag(touch_drag) => {
                 self.mouse_position = touch_drag.start_position;
+                self.mouse_position_valid = true;
                 cx.propagate_event = true;
                 self.default_prevented = false;
                 let started = touch_drag.phase == crate::TouchPhase::Started;
@@ -6537,6 +6590,7 @@ impl Window {
                 } else {
                     long_press.position
                 };
+                self.mouse_position_valid = true;
                 cx.propagate_event = true;
                 self.default_prevented = false;
                 let started = long_press.phase == crate::TouchPhase::Started;
@@ -6617,8 +6671,18 @@ impl Window {
         });
     }
 
+    /// Computes the hit test for the remembered mouse position, or an empty
+    /// one while that position is invalid (the mouse exited the window).
+    fn mouse_hit_test_for_frame(&self, frame: &Frame) -> HitTest {
+        if self.mouse_position_valid {
+            frame.hit_test(self.mouse_position)
+        } else {
+            HitTest::default()
+        }
+    }
+
     fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
-        let hit_test = self.rendered_frame.hit_test(self.mouse_position());
+        let hit_test = self.mouse_hit_test_for_frame(&self.rendered_frame);
         if hit_test != self.mouse_hit_test {
             self.mouse_hit_test = hit_test;
             self.reset_cursor_style(cx);

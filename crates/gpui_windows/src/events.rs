@@ -109,7 +109,7 @@ impl WindowsWindowInner {
             WM_CLOSE => self.handle_close_msg(),
             WM_DESTROY => self.handle_destroy_msg(handle),
             WM_MOUSEMOVE => self.handle_mouse_move_msg(handle, lparam, wparam),
-            WM_MOUSELEAVE | WM_NCMOUSELEAVE => self.handle_mouse_leave_msg(),
+            WM_MOUSELEAVE | WM_NCMOUSELEAVE => self.handle_mouse_leave_msg(handle),
             WM_NCMOUSEMOVE => self.handle_nc_mouse_move_msg(handle, lparam),
             // Treat double click as a second single click, since we track the double clicks ourselves.
             // If you don't interact with any elements, this will fall through to the windows default
@@ -381,7 +381,7 @@ impl WindowsWindowInner {
         if handled { Some(0) } else { Some(1) }
     }
 
-    fn handle_mouse_leave_msg(&self) -> Option<isize> {
+    fn handle_mouse_leave_msg(&self, handle: HWND) -> Option<isize> {
         self.state.hovered.set(false);
         // The next window's `WM_SETCURSOR` picks its own cursor, so we just clear
         // the flag for tight `is_cursor_visible()` semantics.
@@ -394,7 +394,82 @@ impl WindowsWindowInner {
                 .set(Some(callback));
         }
 
+        // `WM_MOUSELEAVE` also fires when the cursor moves from the client area
+        // into the non-client area (e.g. the title bar). Before reporting the
+        // exit to the app, verify against the real cursor position that it
+        // actually left the window; otherwise hovering the title bar would
+        // clear hover state and the caption buttons would flash.
+        let Some(cursor_point) = Self::cursor_outside_client_area(handle) else {
+            // The cursor is still over the window. The leave message disarmed
+            // the tracking, so re-arm it; otherwise a fast flick out of the
+            // window from the title bar would never report an exit. Pick the
+            // flags by the region the cursor is actually in, so the armed
+            // condition isn't already satisfied (which would repost the leave
+            // message every time the cursor moves, and re-arm it in a loop).
+            let flags = if Self::cursor_over_client_area(handle) {
+                TME_LEAVE
+            } else {
+                TME_LEAVE | TME_NONCLIENT
+            };
+            self.start_tracking_mouse(handle, flags);
+            return Some(0);
+        };
+
+        if let Some(mut func) = self.state.callbacks.input.take() {
+            let scale_factor = self.state.scale_factor.get();
+            let input = PlatformInput::MouseExited(MouseExitEvent {
+                position: logical_point(cursor_point.x as f32, cursor_point.y as f32, scale_factor),
+                pressed_button: None,
+                modifiers: current_modifiers(),
+            });
+            func(input);
+            self.state.callbacks.input.set(Some(func));
+        }
+
         Some(0)
+    }
+
+    /// Returns the real cursor position in window client coordinates when the
+    /// cursor is outside of the client rectangle, or `None` when it is still
+    /// inside the window. An undeterminable position is treated as outside,
+    /// so the exit is never lost; the core doesn't trust exit positions anyway.
+    fn cursor_outside_client_area(handle: HWND) -> Option<POINT> {
+        let mut client_rect = RECT::default();
+        if unsafe { GetClientRect(handle, &mut client_rect) }.is_err() {
+            return Some(POINT { x: 0, y: 0 });
+        }
+        let mut cursor_point = POINT { x: 0, y: 0 };
+        if unsafe { GetCursorPos(&mut cursor_point) }.is_err() {
+            return Some(POINT { x: 0, y: 0 });
+        }
+        if unsafe { ScreenToClient(handle, &mut cursor_point) }
+            .ok()
+            .is_err()
+        {
+            return Some(POINT { x: 0, y: 0 });
+        }
+        let outside = cursor_point.x < client_rect.left
+            || cursor_point.x >= client_rect.right
+            || cursor_point.y < client_rect.top
+            || cursor_point.y >= client_rect.bottom;
+        outside.then_some(cursor_point)
+    }
+
+    /// Asks the window where the real cursor currently is, returning whether
+    /// it is over the client area (`HTCLIENT`).
+    fn cursor_over_client_area(handle: HWND) -> bool {
+        let mut cursor_point = POINT { x: 0, y: 0 };
+        if unsafe { GetCursorPos(&mut cursor_point) }.is_err() {
+            // Assume the common case; a wrong guess only re-arms tracking
+            // with one extra flag.
+            return true;
+        }
+        let lparam = LPARAM(
+            (((cursor_point.y as i16 as i32) << 16) | (cursor_point.x as i16 as u16 as i32))
+                as isize,
+        );
+        let hit = unsafe { SendMessageW(handle, WM_NCHITTEST, Some(WPARAM(0)), Some(lparam)) };
+        hit.0 == HTCLIENT as isize
     }
 
     fn handle_syskeyup_msg(&self, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {

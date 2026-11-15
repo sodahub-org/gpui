@@ -2210,11 +2210,15 @@ impl Window {
         });
         platform_window.on_hit_test_window_control({
             let mut cx = cx.to_async();
-            Box::new(move || {
+            Box::new(move |position| {
                 handle
                     .update(&mut cx, |_, window, _cx| {
+                        // Answer from the queried position, not from the remembered
+                        // hover hit test: after the mouse left the window, that
+                        // memory is stale and would report controls for any point.
+                        let hit_test = window.rendered_frame.hit_test(position);
                         for (area, hitbox) in &window.rendered_frame.window_control_hitboxes {
-                            if window.mouse_hit_test.ids.contains(&hitbox.id) {
+                            if hit_test.ids.contains(&hitbox.id) {
                                 return Some(*area);
                             }
                         }

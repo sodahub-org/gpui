@@ -1286,7 +1286,15 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// outside of any window update.
     fn on_display_changed(&self, callback: Box<dyn FnMut()>);
     fn on_should_close(&self, callback: Box<dyn FnMut() -> bool>);
-    fn on_hit_test_window_control(&self, callback: Box<dyn FnMut() -> Option<WindowControlArea>>);
+    /// Registers the callback invoked to answer `WM_NCHITTEST`-style queries for
+    /// which window control area (drag, close, min, max) the given position falls
+    /// into. The position is the one the system asks about *this time*, in logical
+    /// window coordinates; the answer must be computed from it rather than from
+    /// remembered hover state, which can be stale after the mouse left the window.
+    fn on_hit_test_window_control(
+        &self,
+        callback: Box<dyn FnMut(Point<Pixels>) -> Option<WindowControlArea>>,
+    );
     fn on_close(&self, callback: Box<dyn FnOnce()>);
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}

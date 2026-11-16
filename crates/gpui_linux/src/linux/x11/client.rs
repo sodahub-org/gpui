@@ -79,6 +79,12 @@ pub(crate) const XINPUT_ALL_DEVICE_GROUPS: xinput::DeviceId = 1;
 
 const GPUI_X11_SCALE_FACTOR_ENV: &str = "GPUI_X11_SCALE_FACTOR";
 
+/// XI2 reports pointer positions as 16.16 fixed point: one whole unit is
+/// `1 << 16`, not `u16::MAX`. Dividing by `u16::MAX` pushes a coordinate on the
+/// right or bottom edge just past the window bounds, which makes the hit test
+/// come back empty.
+const XINPUT_FIXED_POINT_SCALE: f32 = 65536.0;
+
 pub(crate) struct WindowRef {
     window: X11WindowStatePtr,
     refresh_state: Option<RefreshState>,
@@ -1236,8 +1242,8 @@ impl X11Client {
                 state.modifiers = modifiers;
 
                 let position = point(
-                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
-                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(event.event_x as f32 / XINPUT_FIXED_POINT_SCALE / state.scale_factor),
+                    px(event.event_y as f32 / XINPUT_FIXED_POINT_SCALE / state.scale_factor),
                 );
 
                 if state.composing && state.ximc.is_some() {
@@ -1312,8 +1318,8 @@ impl X11Client {
                 state.modifiers = modifiers;
 
                 let position = point(
-                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
-                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(event.event_x as f32 / XINPUT_FIXED_POINT_SCALE / state.scale_factor),
+                    px(event.event_y as f32 / XINPUT_FIXED_POINT_SCALE / state.scale_factor),
                 );
                 match button_or_scroll_from_event_detail(event.detail) {
                     Some(ButtonOrScroll::Button(button)) => {
@@ -1363,8 +1369,8 @@ impl X11Client {
                 }
                 let pressed_button = pressed_button_from_mask(event.button_mask[0]);
                 let position = point(
-                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
-                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(event.event_x as f32 / XINPUT_FIXED_POINT_SCALE / state.scale_factor),
+                    px(event.event_y as f32 / XINPUT_FIXED_POINT_SCALE / state.scale_factor),
                 );
                 let modifiers = modifiers_from_xinput_info(event.mods);
                 state.modifiers = modifiers;
@@ -1401,8 +1407,8 @@ impl X11Client {
                 let pressed_button =
                     pressed_button_from_mask(event.buttons.first().copied().unwrap_or(0));
                 let position = point(
-                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
-                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(event.event_x as f32 / XINPUT_FIXED_POINT_SCALE / state.scale_factor),
+                    px(event.event_y as f32 / XINPUT_FIXED_POINT_SCALE / state.scale_factor),
                 );
                 let modifiers = modifiers_from_xinput_info(event.mods);
                 state.modifiers = modifiers;
@@ -1426,8 +1432,8 @@ impl X11Client {
                 state.mouse_focused_window = None;
                 let pressed_button = pressed_button_from_mask(event.buttons[0]);
                 let position = point(
-                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
-                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(event.event_x as f32 / XINPUT_FIXED_POINT_SCALE / state.scale_factor),
+                    px(event.event_y as f32 / XINPUT_FIXED_POINT_SCALE / state.scale_factor),
                 );
                 let modifiers = modifiers_from_xinput_info(event.mods);
                 state.modifiers = modifiers;
@@ -1470,8 +1476,8 @@ impl X11Client {
                 let modifiers = modifiers_from_xinput_info(event.mods);
                 state.modifiers = modifiers;
                 let position = point(
-                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
-                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(event.event_x as f32 / XINPUT_FIXED_POINT_SCALE / state.scale_factor),
+                    px(event.event_y as f32 / XINPUT_FIXED_POINT_SCALE / state.scale_factor),
                 );
                 drop(state);
                 window.handle_input(PlatformInput::Pinch(gpui::PinchEvent {
@@ -1487,8 +1493,8 @@ impl X11Client {
                 let modifiers = modifiers_from_xinput_info(event.mods);
                 state.modifiers = modifiers;
                 let position = point(
-                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
-                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(event.event_x as f32 / XINPUT_FIXED_POINT_SCALE / state.scale_factor),
+                    px(event.event_y as f32 / XINPUT_FIXED_POINT_SCALE / state.scale_factor),
                 );
                 // scale is in FP16.16 format: divide by 65536 to get the float value
                 let new_absolute_scale = event.scale as f32 / 65536.0;
@@ -1510,8 +1516,8 @@ impl X11Client {
                 let modifiers = modifiers_from_xinput_info(event.mods);
                 state.modifiers = modifiers;
                 let position = point(
-                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
-                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(event.event_x as f32 / XINPUT_FIXED_POINT_SCALE / state.scale_factor),
+                    px(event.event_y as f32 / XINPUT_FIXED_POINT_SCALE / state.scale_factor),
                 );
                 drop(state);
                 window.handle_input(PlatformInput::Pinch(gpui::PinchEvent {

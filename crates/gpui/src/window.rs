@@ -2973,6 +2973,10 @@ impl Window {
     /// The mouse position and the hit test under it are still refreshed, so the
     /// cursor follows a window that moves under a still pointer. The hover
     /// highlight itself only repaints with the next frame.
+    ///
+    /// An active drag still redraws: the drag preview is painted at
+    /// `mouse_position - cursor_offset`, so it has to follow the pointer to the
+    /// window's new position instead of travelling with the old frame.
     pub fn bounds_changed(&mut self, cx: &mut App) {
         let scale_factor = self.platform_window.scale_factor();
         let viewport_size = self.platform_window.content_size();
@@ -2983,7 +2987,7 @@ impl Window {
         self.viewport_size = viewport_size;
         self.mouse_position = self.platform_window.mouse_position();
 
-        if client_area_changed {
+        if client_area_changed || cx.has_active_drag() {
             self.refresh();
         } else {
             // Nothing will be drawn, so nothing else re-runs the hit test here.

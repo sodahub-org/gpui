@@ -1397,6 +1397,26 @@ impl X11Client {
                 let mut state = self.0.borrow_mut();
                 state.mouse_focused_window = Some(event.event);
                 state.restore_cursor_after_hide();
+
+                let pressed_button =
+                    pressed_button_from_mask(event.buttons.first().copied().unwrap_or(0));
+                let position = point(
+                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                );
+                let modifiers = modifiers_from_xinput_info(event.mods);
+                state.modifiers = modifiers;
+                drop(state);
+
+                // No Motion follows Enter unless the pointer keeps moving, so synthesize
+                // a MouseMove to establish hover at the entry position. Without it the
+                // window never learns the pointer is inside, and a window that slides
+                // under a still pointer keeps the old hover state and cursor.
+                window.handle_input(PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                    position,
+                    pressed_button,
+                    modifiers,
+                }));
             }
             Event::XinputLeave(event) if event.mode == xinput::NotifyMode::NORMAL => {
                 let mut state = self.0.borrow_mut();

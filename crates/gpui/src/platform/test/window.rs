@@ -171,6 +171,20 @@ impl TestWindow {
         }
     }
 
+    /// Moves the window on screen without resizing it, as the platform's move
+    /// callback reports.
+    pub fn simulate_move(&self, origin: Point<Pixels>) {
+        let callback = {
+            let mut lock = self.0.lock();
+            lock.bounds.origin = origin;
+            lock.moved_callback.take()
+        };
+        if let Some(mut callback) = callback {
+            callback();
+            self.0.lock().moved_callback = Some(callback);
+        }
+    }
+
     /// Moves the window to the display with the given ID.
     pub fn simulate_move_to_display(&self, display_id: DisplayId) {
         let callback = {

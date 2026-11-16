@@ -2960,13 +2960,37 @@ impl Window {
     ///
     /// This updates internal state like `viewport_size` and `scale_factor` from
     /// the platform window, then notifies observers. Normally called automatically
-    /// by the platform's resize callback, but exposed publicly for test infrastructure.
+    /// by the platform's resize and move callbacks, but exposed publicly for test
+    /// infrastructure.
+    ///
+    /// A window that only moved keeps showing the same content: elements are laid
+    /// out and drawn in client-area coordinates, and the compositor moves the
+    /// finished frame. Asking for a redraw here would rebuild the whole element
+    /// tree on every move event, which on Windows means once per `WM_MOVE` while
+    /// a window is dragged. So only a change to the client area itself schedules
+    /// a new frame.
+    ///
+    /// The mouse position and the hit test under it are still refreshed, so the
+    /// cursor follows a window that moves under a still pointer. The hover
+    /// highlight itself only repaints with the next frame.
     pub fn bounds_changed(&mut self, cx: &mut App) {
-        self.scale_factor = self.platform_window.scale_factor();
-        self.viewport_size = self.platform_window.content_size();
+        let scale_factor = self.platform_window.scale_factor();
+        let viewport_size = self.platform_window.content_size();
+        let client_area_changed =
+            scale_factor != self.scale_factor || viewport_size != self.viewport_size;
+
+        self.scale_factor = scale_factor;
+        self.viewport_size = viewport_size;
         self.mouse_position = self.platform_window.mouse_position();
 
-        self.refresh();
+        if client_area_changed {
+            self.refresh();
+        } else {
+            // Nothing will be drawn, so nothing else re-runs the hit test here.
+            // Without this, a window moved under a still pointer keeps the hover
+            // state and cursor of its previous position until the next mouse event.
+            self.refresh_mouse_hit_test(cx);
+        }
 
         self.bounds_observers
             .clone()
@@ -6699,12 +6723,18 @@ impl Window {
         }
     }
 
-    fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
+    /// Re-runs the hit test under the remembered mouse position and moves the
+    /// cursor when the element under it changed.
+    fn refresh_mouse_hit_test(&mut self, cx: &mut App) {
         let hit_test = self.mouse_hit_test_for_frame(&self.rendered_frame);
         if hit_test != self.mouse_hit_test {
             self.mouse_hit_test = hit_test;
             self.reset_cursor_style(cx);
         }
+    }
+
+    fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
+        self.refresh_mouse_hit_test(cx);
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         if self.is_inspector_picking(cx) {
@@ -9095,6 +9125,51 @@ mod tests {
                 Empty
             }
         }
+    }
+
+    #[gpui::test]
+    fn test_bounds_changed_redraws_only_when_the_client_area_changes(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let mut platform_window = cx.test_window(window.into());
+
+        // Pretend the initial frame has already been drawn.
+        window
+            .update(cx, |_, window, _| window.invalidator.set_dirty(false))
+            .unwrap();
+        let wakes = platform_window.frame_wake_count();
+
+        // Moving the window keeps the same client area, so the drawn frame is
+        // still valid and no new frame is requested.
+        platform_window.simulate_move(point(px(120.), px(80.)));
+        assert_eq!(
+            platform_window.frame_wake_count(),
+            wakes,
+            "a move must not redraw the window"
+        );
+
+        // Growing the window changes what the client area shows.
+        platform_window.simulate_resize(size(px(640.), px(480.)));
+        assert!(
+            platform_window.frame_wake_count() > wakes,
+            "a resize must redraw the window"
+        );
+        window
+            .update(cx, |_, window, _| {
+                assert_eq!(window.viewport_size(), size(px(640.), px(480.)));
+            })
+            .unwrap();
+
+        // Moving to a display with another scale factor keeps the logical size
+        // but changes the device pixels, so it redraws too.
+        window
+            .update(cx, |_, window, _| window.invalidator.set_dirty(false))
+            .unwrap();
+        let wakes = platform_window.frame_wake_count();
+        platform_window.simulate_scale_factor_change(1.0);
+        assert!(
+            platform_window.frame_wake_count() > wakes,
+            "a scale factor change must redraw the window"
+        );
     }
 
     #[gpui::test]

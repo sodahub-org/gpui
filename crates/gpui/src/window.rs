@@ -1022,7 +1022,7 @@ impl ElementIdStack {
     }
 
     /// The hash of the whole path on the stack.
-    fn hash(&self) -> u64 {
+    pub(crate) fn hash(&self) -> u64 {
         self.hashes
             .last()
             .copied()
@@ -1031,6 +1031,95 @@ impl ElementIdStack {
 
     pub(crate) fn global_id(&self) -> GlobalElementId {
         GlobalElementId::with_hash(&self.ids, self.hash())
+    }
+}
+
+/// Names every layout request of a frame by the place it is asked from, so that the request
+/// for the same place on a later frame finds the layout node this one made. A name is a hash of
+/// the path of elements whose `request_layout` is running: an element with an id is a step by
+/// that id, wherever it stands among its siblings, and one without by its position among the
+/// siblings that have none. Two requests that come to the same name are told apart by the
+/// layout engine, which keeps a node for the first only.
+#[derive(Default)]
+pub(crate) struct LayoutKeys {
+    /// One scope per element whose `request_layout` is running, innermost last.
+    scopes: Vec<LayoutKeyScope>,
+    /// The counts of what was asked for outside any element's `request_layout`, as an element
+    /// laid out as a root during prepaint is, by the id path it was asked under.
+    roots: FxHashMap<u64, LayoutKeyScope>,
+}
+
+#[derive(Default)]
+struct LayoutKeyScope {
+    key: u64,
+    /// How many elements without an id have entered under this scope.
+    children: u32,
+    /// How many nodes this scope's own element has asked for.
+    nodes: u32,
+}
+
+impl LayoutKeys {
+    const ROOT: u64 = 0x9e37_79b9_7f4a_7c15;
+    const BY_ID: u64 = 1;
+    const BY_POSITION: u64 = 2;
+    const OWN_NODE: u64 = 3;
+
+    fn mix(key: u64, kind: u64, value: u64) -> u64 {
+        const SEED: u64 = 0x517c_c1b7_2722_0a95;
+        let key = (key.rotate_left(5) ^ kind).wrapping_mul(SEED);
+        (key.rotate_left(5) ^ value).wrapping_mul(SEED)
+    }
+
+    /// The scope requests are counted in: the innermost element's, or the one of `id_path`
+    /// while no element is requesting layout.
+    fn scope(&mut self, id_path: u64) -> &mut LayoutKeyScope {
+        match self.scopes.is_empty() {
+            false => self.scopes.last_mut().unwrap(),
+            true => self.roots.entry(id_path).or_insert(LayoutKeyScope {
+                key: Self::mix(Self::ROOT, Self::BY_ID, id_path),
+                ..LayoutKeyScope::default()
+            }),
+        }
+    }
+
+    /// Opens the scope of an element about to request its layout. `id` is the hash of its
+    /// global id when it has one, and `id_path` the hash of the id path around it.
+    pub(crate) fn enter(&mut self, id: Option<u64>, id_path: u64) {
+        let scope = self.scope(id_path);
+        let key = match id {
+            Some(id) => Self::mix(scope.key, Self::BY_ID, id),
+            None => {
+                scope.children += 1;
+                Self::mix(scope.key, Self::BY_POSITION, u64::from(scope.children))
+            }
+        };
+        self.scopes.push(LayoutKeyScope {
+            key,
+            ..LayoutKeyScope::default()
+        });
+    }
+
+    /// Closes the scope [`Self::enter`] opened.
+    pub(crate) fn exit(&mut self) {
+        self.scopes.pop();
+    }
+
+    /// The name of the next node the current scope asks for.
+    fn peek(&mut self, id_path: u64) -> u64 {
+        let scope = self.scope(id_path);
+        Self::mix(scope.key, Self::OWN_NODE, u64::from(scope.nodes))
+    }
+
+    /// The name of the node the current scope asks for now.
+    fn take(&mut self, id_path: u64) -> u64 {
+        let key = self.peek(id_path);
+        self.scope(id_path).nodes += 1;
+        key
+    }
+
+    fn clear(&mut self) {
+        self.scopes.clear();
+        self.roots.clear();
     }
 }
 
@@ -1256,6 +1345,7 @@ pub struct Window {
     rem_size_override_stack: SmallVec<[Pixels; 8]>,
     pub(crate) viewport_size: Size<Pixels>,
     layout_engine: Option<TaffyLayoutEngine>,
+    pub(crate) layout_keys: LayoutKeys,
     pub(crate) root: Option<AnyView>,
     pub(crate) element_id_stack: ElementIdStack,
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
@@ -1319,6 +1409,12 @@ pub struct Window {
     long_press_timer: Option<Task<()>>,
     long_press_capture: Option<EntityId>,
     pub(crate) refreshing: bool,
+    /// How many frames this window has finished drawing. What a frame records is read back
+    /// only on the frame right after it, so a cached view stamps its recorded ranges with it.
+    pub(crate) drawn_frames: u64,
+    /// Cached views this frame replayed under another opacity than they painted with. They
+    /// render on the next frame, which is drawn for them.
+    pub(crate) faded_views: Vec<EntityId>,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
     focus_enabled: bool,
@@ -2206,6 +2302,7 @@ impl Window {
             rem_size_override_stack: SmallVec::new(),
             viewport_size: content_size,
             layout_engine: Some(TaffyLayoutEngine::new()),
+            layout_keys: LayoutKeys::default(),
             root: None,
             element_id_stack: ElementIdStack::default(),
             text_style_stack: Vec::new(),
@@ -2255,6 +2352,8 @@ impl Window {
             long_press_timer: None,
             long_press_capture: None,
             refreshing: false,
+            drawn_frames: 0,
+            faded_views: Vec::new(),
             activation_observers: SubscriberSet::new(),
             focus: None,
             focus_enabled: true,
@@ -3637,6 +3736,7 @@ impl Window {
         }
 
         self.layout_engine.as_mut().unwrap().clear();
+        self.layout_keys.clear();
         self.text_system().finish_frame();
         self.next_frame.finish(&mut self.rendered_frame);
 
@@ -3645,6 +3745,14 @@ impl Window {
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.next_frame.clear();
+        self.drawn_frames += 1;
+        // Marked against the frame just drawn, whose dispatch tree holds their ancestors.
+        if !self.faded_views.is_empty() {
+            for view_id in mem::take(&mut self.faded_views) {
+                self.mark_view_dirty(view_id);
+            }
+            self.invalidator.set_dirty(true);
+        }
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
         let mut focus_before_listeners = self.focus;
@@ -4872,12 +4980,37 @@ impl Window {
                 continue;
             }
             let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
+            // The spread grows the rounded corners with the box, as CSS does, so a ring drawn
+            // with a spread keeps one width around the corners. A square corner stays square,
+            // and a corner rounded less than the spread grows by less, so it does not jump to
+            // the full spread.
+            let spread = |radius: Pixels| {
+                let reach = shadow.spread_radius;
+                if radius <= Pixels::ZERO {
+                    return radius;
+                }
+                if reach <= Pixels::ZERO {
+                    return (radius + reach).max(Pixels::ZERO);
+                }
+                let ratio = radius / reach;
+                let grow = match ratio < 1. {
+                    true => reach * (1. + (ratio - 1.).powi(3)),
+                    false => reach,
+                };
+                radius + grow
+            };
+            let shadow_corner_radii = Corners {
+                top_left: spread(corner_radii.top_left),
+                top_right: spread(corner_radii.top_right),
+                bottom_right: spread(corner_radii.bottom_right),
+                bottom_left: spread(corner_radii.bottom_left),
+            };
             self.next_frame.scene.insert_primitive(Shadow {
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor),
                 bounds: self.cover_bounds(shadow_bounds),
                 content_mask,
-                corner_radii: corner_radii.scale(scale_factor),
+                corner_radii: shadow_corner_radii.scale(scale_factor),
                 color: shadow.color.opacity(opacity),
                 element_bounds,
                 element_corner_radii,
@@ -5168,8 +5301,13 @@ impl Window {
     /// Note that the `quad.corner_radii` are allowed to exceed the bounds, creating sharp corners
     /// where the circular arcs meet. This will not display well when combined with dashed borders.
     /// Use `Corners::clamp_radii_for_quad_size` if the radii should fit within the bounds.
-    pub fn paint_quad(&mut self, quad: PaintQuad) {
+    pub fn paint_quad(&mut self, quad: impl Into<SmoothQuad>) {
         self.invalidator.debug_assert_paint();
+
+        let SmoothQuad {
+            quad,
+            corner_smoothing,
+        } = quad.into();
 
         let opacity = self.element_opacity();
         let snapped_bounds = self.snap_bounds(quad.bounds);
@@ -5183,7 +5321,7 @@ impl Window {
             corner_radii: quad.corner_radii.scale(self.scale_factor()),
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
-            corner_smoothing: quad.corner_smoothing,
+            corner_smoothing,
             pad: 0,
         };
 
@@ -5710,8 +5848,10 @@ impl Window {
         cx.layout_id_buffer.extend(children);
         let rem_size = self.rem_size();
         let scale_factor = self.scale_factor();
+        let key = self.layout_keys.take(self.element_id_stack.hash());
 
         self.layout_engine.as_mut().unwrap().request_layout(
+            Some(key),
             style,
             rem_size,
             scale_factor,
@@ -5732,14 +5872,41 @@ impl Window {
         F: Fn(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
             + 'static,
     {
+        self.request_measured(style, crate::taffy::Measured::new(measure))
+    }
+
+    /// How many layout nodes have been made or written to. See [`TaffyLayoutEngine::writes`].
+    #[cfg(test)]
+    pub(crate) fn layout_writes(&self) -> usize {
+        self.layout_engine
+            .as_ref()
+            .map_or(0, |engine| engine.writes)
+    }
+
+    /// What the element that measured the node at the place the next request names left with
+    /// it on an earlier frame. An element that finds it measures as that one did moves over
+    /// what the measuring produced and asks with [`crate::taffy::Measured::remembered`], and
+    /// the node is then not measured again while what is around it lays it out as before.
+    pub(crate) fn retained_measure(&mut self) -> Option<Rc<dyn Any>> {
+        let key = self.layout_keys.peek(self.element_id_stack.hash());
+        self.layout_engine.as_ref()?.retained_memo(key)
+    }
+
+    /// [`Self::request_measured_layout`] for an element that may leave a memo with the node.
+    pub(crate) fn request_measured(
+        &mut self,
+        style: Style,
+        measured: crate::taffy::Measured,
+    ) -> LayoutId {
         self.invalidator.debug_assert_prepaint();
 
         let rem_size = self.rem_size();
         let scale_factor = self.scale_factor();
+        let key = self.layout_keys.take(self.element_id_stack.hash());
         self.layout_engine
             .as_mut()
             .unwrap()
-            .request_measured_layout(style, rem_size, scale_factor, measure)
+            .request_measured_layout(Some(key), style, rem_size, scale_factor, measured)
     }
 
     /// Compute the layout for the given id within the given available space.
@@ -8412,17 +8579,33 @@ pub struct PaintQuad {
     pub border_color: Hsla,
     /// The style of the quad's borders.
     pub border_style: BorderStyle,
-    /// How far the corners are smoothed from circular arcs towards a squircle, from 0 to 1.
-    /// See [`crate::Styled::corner_smoothing`].
+}
+
+/// A quad whose corners are smoothed from circular arcs towards a squircle. Kept apart from
+/// [`PaintQuad`] so code that builds a `PaintQuad` for upstream GPUI builds against this one.
+#[derive(Clone)]
+pub struct SmoothQuad {
+    /// The quad to paint.
+    pub quad: PaintQuad,
+    /// How far its corners are smoothed, from 0 to 1. See [`crate::Styled::corner_smoothing`].
     pub corner_smoothing: f32,
+}
+
+impl From<PaintQuad> for SmoothQuad {
+    fn from(quad: PaintQuad) -> Self {
+        SmoothQuad {
+            quad,
+            corner_smoothing: 0.,
+        }
+    }
 }
 
 impl PaintQuad {
     /// Sets how far the quad's corners are smoothed towards a squircle, from 0 to 1.
-    pub fn corner_smoothing(self, corner_smoothing: f32) -> Self {
-        PaintQuad {
+    pub fn corner_smoothing(self, corner_smoothing: f32) -> SmoothQuad {
+        SmoothQuad {
+            quad: self,
             corner_smoothing: corner_smoothing.clamp(0.0, 1.0),
-            ..self
         }
     }
 
@@ -8480,7 +8663,6 @@ pub fn quad(
         border_widths: border_widths.into(),
         border_color: border_color.into(),
         border_style,
-        corner_smoothing: 0.,
     }
 }
 
@@ -8493,7 +8675,6 @@ pub fn fill(bounds: impl Into<Bounds<Pixels>>, background: impl Into<Background>
         border_widths: (0.).into(),
         border_color: transparent_black(),
         border_style: BorderStyle::default(),
-        corner_smoothing: 0.,
     }
 }
 
@@ -8510,7 +8691,6 @@ pub fn outline(
         border_widths: (1.).into(),
         border_color: border_color.into(),
         border_style,
-        corner_smoothing: 0.,
     }
 }
 

@@ -1,0 +1,28 @@
+name: windows
+
+# Builds the crates for Windows and runs the gpui tests on a real Windows
+# machine, since the development machines here are not Windows boxes. This
+# workflow lives on a throwaway branch so a candidate branch can be checked
+# without adding anything to the branch itself.
+on:
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/gpui-windows.yml"
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      # Debug builds only: the HLSL shaders are compiled by fxc in release
+      # builds, and by the app itself at startup in debug ones.
+      - name: Build gpui for Windows
+        run: cargo build --package gpui --package gpui_windows
+      - name: Test gpui
+        run: cargo test --package gpui --lib
